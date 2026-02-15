@@ -627,19 +627,20 @@ class Interface(Logger):
     async def request_chunk(self, height: int, tip=None, *, can_return_early=False):
         if not is_non_negative_integer(height):
             raise Exception(f"{repr(height)} is not a block height")
-        index = height // 672
-        if can_return_early and index in self._requested_chunks:
+        batch_index = height // constants.RETARGET_INTERVAL
+        batch_start = batch_index * constants.RETARGET_INTERVAL
+        if can_return_early and batch_index in self._requested_chunks:
             return
         self.logger.info(f"requesting chunk from height {height}")
-        size = 672
+        size = constants.RETARGET_INTERVAL
         if tip is not None:
-            size = min(size, tip - index * 672 + 1)
+            size = min(size, tip - batch_start + 1)
             size = max(size, 0)
         try:
-            self._requested_chunks.add(index)
-            res = await self.session.send_request('blockchain.block.headers', [index * 672, size])
+            self._requested_chunks.add(batch_index)
+            res = await self.session.send_request('blockchain.block.headers', [batch_start, size])
         finally:
-            self._requested_chunks.discard(index)
+            self._requested_chunks.discard(batch_index)
         assert_dict_contains_field(res, field_name='count')
         assert_dict_contains_field(res, field_name='hex')
         assert_dict_contains_field(res, field_name='max')
@@ -648,15 +649,23 @@ class Interface(Logger):
         assert_hex_str(res['hex'])
         if len(res['hex']) != HEADER_SIZE * 2 * res['count']:
             raise RequestCorrupted('inconsistent chunk hex and count')
-        # we never request more than 672 headers, but we enforce those fit in a single response
-        if res['max'] < 672:
-            raise RequestCorrupted(f"server uses too low 'max' count for block.headers: {res['max']} < 672")
+        if res['max'] < constants.RETARGET_INTERVAL:
+            raise RequestCorrupted(f"server uses too low 'max' count for block.headers: {res['max']} < {constants.RETARGET_INTERVAL}")
         if res['count'] != size:
             raise RequestCorrupted(f"expected {size} headers but only got {res['count']}")
-        conn = self.blockchain.connect_chunk(index, res['hex'])
-        if not conn:
-            return conn, 0
-        return conn, res['count']
+        # Split into sub-chunks and verify each
+        data = bytes.fromhex(res['hex'])
+        total_headers = res['count']
+        num_connected = 0
+        for offset in range(0, total_headers, constants.CHUNK_SIZE):
+            sub_count = min(constants.CHUNK_SIZE, total_headers - offset)
+            sub_data = data[offset * HEADER_SIZE : (offset + sub_count) * HEADER_SIZE]
+            sub_index = (batch_start + offset) // constants.CHUNK_SIZE
+            conn = self.blockchain.connect_chunk(sub_index, sub_data.hex())
+            if not conn:
+                return conn, num_connected
+            num_connected += sub_count
+        return True, num_connected
 
     def is_main_server(self) -> bool:
         return (self.network.interface == self or
@@ -797,7 +806,7 @@ class Interface(Logger):
                     last, height = await self.step(height)
                     continue
                 util.trigger_callback('network_updated')
-                height = (height // 672 * 672) + num_headers
+                height = (height // constants.RETARGET_INTERVAL * constants.RETARGET_INTERVAL) + num_headers
                 assert height <= next_height+1, (height, self.tip)
                 last = 'catchup'
             else:

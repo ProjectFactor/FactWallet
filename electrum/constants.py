@@ -44,6 +44,9 @@ GIT_REPO_URL = "https://github.com/spesmilo/electrum"
 GIT_REPO_ISSUES_URL = "https://github.com/spesmilo/electrum/issues"
 BIP39_WALLET_FORMATS = read_json('bip39_wallet_formats.json', [])
 
+CHUNK_SIZE = 42
+RETARGET_INTERVAL = CHUNK_SIZE * 16  # normal difficulty retarget period (672 blocks)
+
 
 class AbstractNet:
 
@@ -61,7 +64,7 @@ class AbstractNet:
 
     @classmethod
     def max_checkpoint(cls) -> int:
-        return max(0, len(cls.CHECKPOINTS) * 672 - 1)
+        return max(0, len(cls.CHECKPOINTS) * CHUNK_SIZE - 1)
 
     @classmethod
     def rev_genesis_bytes(cls) -> bytes:

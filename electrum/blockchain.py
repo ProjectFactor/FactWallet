@@ -53,22 +53,58 @@ $ ./factorn-cli getblockchaininfo
   "softforks": {
     (...)
     "hard_diff_removal": {
+      "type": "buried",
+      "active": true,
+      "height": 168672
+    },
+    "interim_daa": {
       "type": "bip9",
       "bip9": {
-        "status": "active",
-        "start_time": 1743465600,
-        "timeout": 1775001600,
-        "since": 168672,
-        "min_activation_height": 160000
+        "status": "locked_in",
+        "start_time": 1767225600,
+        "timeout": 1784505600,
+        "since": 172116,
+        "min_activation_height": 0
       },
-      "height": 168672,
-      "active": true
+      "active": false
     }
   },
-  "warnings": ""
+  (...)
 }
 """
 MAINNET_HARD_DIFF_REMOVAL_ACTIVATION_HEIGHT = 168672
+
+MAINNET_INTERIM_DAA_ACTIVATION_HEIGHT = 172116 + 42  # 172158
+MAINNET_INTERIM_DAA_END_HEIGHT = MAINNET_INTERIM_DAA_ACTIVATION_HEIGHT + 1344  # 173502
+INTERIM_DAA_PERIOD = 42
+INTERIM_DAA_TARGET_TIMESPAN = (INTERIM_DAA_PERIOD - 1) * 30 * 60  # 73800 seconds
+
+
+def is_interim_daa_active(height: int) -> bool:
+    return MAINNET_INTERIM_DAA_ACTIVATION_HEIGHT <= height < MAINNET_INTERIM_DAA_END_HEIGHT
+
+
+def calculate_interim_daa_delta(nBits: int, proportion: float) -> int:
+    # See CalculateInterimDifficultyDelta in src/pow.cpp
+    delta = 0
+    if nBits % 2 != 0:
+        delta -= 1
+
+    if proportion < 0.5:
+        delta += 6
+    elif proportion < 0.6667:
+        delta += 4
+    elif proportion < 0.9:
+        delta += 2
+    elif proportion > 2.0:
+        delta -= 6
+    elif proportion > 1.5:
+        delta -= 4
+    elif proportion > 1.0333:
+        delta -= 2
+
+    return delta
+
 
 class MissingHeader(Exception):
     pass
@@ -199,7 +235,7 @@ _CHAINWORK_CACHE = {
 def init_headers_file_for_best_chain():
     b = get_best_chain()
     filename = b.path()
-    length = HEADER_SIZE * len(constants.net.CHECKPOINTS) * 672
+    length = HEADER_SIZE * len(constants.net.CHECKPOINTS) * constants.CHUNK_SIZE
     if not os.path.exists(filename) or os.path.getsize(filename) < length:
         with open(filename, 'wb') as f:
             if length > 0:
@@ -378,7 +414,7 @@ class Blockchain(Logger):
 
     def verify_chunk(self, index: int, data: bytes) -> None:
         num = len(data) // HEADER_SIZE
-        start_height = index * 672  
+        start_height = index * constants.CHUNK_SIZE
         prev_hash = self.get_hash(start_height - 1)
         target = self.get_target(index-1)
         for i in range(num):
@@ -388,7 +424,7 @@ class Blockchain(Logger):
             except MissingHeader:
                 expected_header_hash = None
             raw_header = data[i*HEADER_SIZE : (i+1)*HEADER_SIZE]
-            header = deserialize_header(raw_header, index*672 + i)
+            header = deserialize_header(raw_header, index * constants.CHUNK_SIZE + i)
             self.verify_header(header, prev_hash, target, expected_header_hash)
             prev_hash = hash_header(header)
 
@@ -415,7 +451,7 @@ class Blockchain(Logger):
             main_chain.save_chunk(index, chunk)
             return
 
-        delta_height = (index * 672 - self.forkpoint)
+        delta_height = (index * constants.CHUNK_SIZE - self.forkpoint)
         delta_bytes = delta_height * HEADER_SIZE
         # if this chunk contains our forkpoint, only save the part after forkpoint
         # (the part before is the responsibility of the parent)
@@ -566,7 +602,7 @@ class Blockchain(Logger):
     def get_hash(self, height: int) -> str:
         def is_height_checkpoint():
             within_cp_range = height <= constants.net.max_checkpoint()
-            at_chunk_boundary = (height+1) % 672 == 0
+            at_chunk_boundary = (height+1) % constants.CHUNK_SIZE == 0
             return within_cp_range and at_chunk_boundary
 
         if height == -1:
@@ -574,7 +610,7 @@ class Blockchain(Logger):
         elif height == 0:
             return constants.net.GENESIS
         elif is_height_checkpoint():
-            index = height // 672
+            index = height // constants.CHUNK_SIZE
             h, t = self.checkpoints[index]
             return h
         else:
@@ -583,16 +619,12 @@ class Blockchain(Logger):
                 raise MissingHeader(height)
             return hash_header(header)
 
-    def get_target(self, index: int) -> int:
-        # compute target from chunk x, used in chunk x+1
-        if constants.net.TESTNET:
-            return 0
-        if index == -1:
-            return MIN_TARGET
-
+    def get_epoch_target(self, epoch_index: int) -> int:
+        """Compute target from retarget epoch epoch_index, used in epoch epoch_index+1.
+        Preserves the existing 672-block retarget logic."""
         # new target
-        first = self.read_header(index * 672)
-        last = self.read_header(index * 672 + 671)
+        first = self.read_header(epoch_index * constants.RETARGET_INTERVAL)
+        last = self.read_header(epoch_index * constants.RETARGET_INTERVAL + constants.RETARGET_INTERVAL - 1)
         if not first or not last:
             raise MissingHeader()
 
@@ -603,7 +635,7 @@ class Blockchain(Logger):
         new_target = nBits
 
         # Determine if hard diff removal is active
-        firstBlockHeightThisEpoch = (index + 1) * 672
+        firstBlockHeightThisEpoch = (epoch_index + 1) * constants.RETARGET_INTERVAL
         hardDiffRemoved = firstBlockHeightThisEpoch >= MAINNET_HARD_DIFF_REMOVAL_ACTIVATION_HEIGHT
 
         # Retarget
@@ -634,6 +666,40 @@ class Blockchain(Logger):
 
         return new_target
 
+    def get_interim_daa_target(self, chunk_index: int) -> int:
+        """Compute target for chunk chunk_index+1 using the 42-block interim DAA."""
+        first_height = chunk_index * constants.CHUNK_SIZE
+        last_height = first_height + constants.CHUNK_SIZE - 1
+        first = self.read_header(first_height)
+        last = self.read_header(last_height)
+        if not first or not last:
+            raise MissingHeader()
+
+        nActualTimespan = last.get('timestamp') - first.get('timestamp')
+        proportion = nActualTimespan / INTERIM_DAA_TARGET_TIMESPAN
+        nBits = int(last.get('bits'))
+        delta = calculate_interim_daa_delta(nBits, proportion)
+        return nBits + delta
+
+    def get_target(self, chunk_index: int) -> int:
+        """Returns the target applicable to chunk chunk_index+1."""
+        if constants.net.TESTNET:
+            return 0
+        if chunk_index == -1:
+            return MIN_TARGET
+        if chunk_index < len(self.checkpoints):
+            _, target = self.checkpoints[chunk_index]
+            return target
+        next_chunk_start = (chunk_index + 1) * constants.CHUNK_SIZE
+
+        if is_interim_daa_active(next_chunk_start):
+            return self.get_interim_daa_target(chunk_index)
+
+        epoch_index = next_chunk_start // constants.RETARGET_INTERVAL
+        if epoch_index == 0:
+            return MIN_TARGET
+        return self.get_epoch_target(epoch_index - 1)
+
 
     @classmethod
     def target_to_bits(cls, target: int) -> int:
@@ -654,7 +720,7 @@ class Blockchain(Logger):
 
     def chainwork_of_header_at_height(self, height: int) -> int:
         """work done by single header at given height"""
-        chunk_idx = height // 672 - 1
+        chunk_idx = height // constants.CHUNK_SIZE - 1
         target = self.get_target(chunk_idx)
         work = ((2 ** 256 - target - 1) // (target + 1)) + 1
         return work
@@ -667,23 +733,23 @@ class Blockchain(Logger):
             # On testnet/regtest, difficulty works somewhat different.
             # It's out of scope to properly implement that.
             return height
-        last_retarget = height // 672 * 672 - 1
+        last_retarget = height // constants.CHUNK_SIZE * constants.CHUNK_SIZE - 1
         cached_height = last_retarget
         while _CHAINWORK_CACHE.get(self.get_hash(cached_height)) is None:
             if cached_height <= -1:
                 break
-            cached_height -= 672
+            cached_height -= constants.CHUNK_SIZE
         assert cached_height >= -1, cached_height
         running_total = _CHAINWORK_CACHE[self.get_hash(cached_height)]
         while cached_height < last_retarget:
-            cached_height += 672
+            cached_height += constants.CHUNK_SIZE
             work_in_single_header = self.chainwork_of_header_at_height(cached_height)
-            work_in_chunk = 672 * work_in_single_header
+            work_in_chunk = constants.CHUNK_SIZE * work_in_single_header
             running_total += work_in_chunk
             _CHAINWORK_CACHE[self.get_hash(cached_height)] = running_total
-        cached_height += 672
+        cached_height += constants.CHUNK_SIZE
         work_in_single_header = self.chainwork_of_header_at_height(cached_height)
-        work_in_last_partial_chunk = (height % 672 + 1) * work_in_single_header
+        work_in_last_partial_chunk = (height % constants.CHUNK_SIZE + 1) * work_in_single_header
         return running_total + work_in_last_partial_chunk
 
     def can_connect(self, header: dict, check_height: bool=True) -> bool:
@@ -701,7 +767,7 @@ class Blockchain(Logger):
         if prev_hash != header.get('prev_block_hash'):
             return False
         try:
-            target = self.get_target(height // 672 - 1)
+            target = self.get_target(height // constants.CHUNK_SIZE - 1)
         except MissingHeader:
             return False
         try:
@@ -724,9 +790,9 @@ class Blockchain(Logger):
     def get_checkpoints(self):
         # for each chunk, store the hash of the last block and the target after the chunk
         cp = []
-        n = self.height() // 672
+        n = self.height() // constants.CHUNK_SIZE
         for index in range(n):
-            h = self.get_hash((index+1) * 672 -1)
+            h = self.get_hash((index+1) * constants.CHUNK_SIZE -1)
             target = self.get_target(index)
             cp.append((h, target))
         return cp

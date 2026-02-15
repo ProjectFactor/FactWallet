@@ -1,4 +1,4 @@
-# Lightweigth FactWallet 
+# Lightweight FactWallet 
 ```
 Licence: MIT Licence
 Language: Python (>= 3.8)
