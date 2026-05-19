@@ -32,6 +32,7 @@ from . import constants
 from .util import bfh, with_lock
 from .logging import get_logger, Logger
 from .gHash import gHash
+from .asert.asert_table import LOG2_COMPUTE_TABLE
 from sympy import isprime
 
 if TYPE_CHECKING:
@@ -67,6 +68,18 @@ $ ./factorn-cli getblockchaininfo
         "min_activation_height": 0
       },
       "active": false
+    },
+    "asert": {
+      "type": "bip9",
+      "bip9": {
+        "status": "active",
+        "start_time": 1772323200,
+        "timeout": 1803859200,
+        "since": 176064,
+        "min_activation_height": 0
+      },
+      "height": 176064,
+      "active": true
     }
   },
   (...)
@@ -79,9 +92,34 @@ MAINNET_INTERIM_DAA_END_HEIGHT = MAINNET_INTERIM_DAA_ACTIVATION_HEIGHT + 1344  #
 INTERIM_DAA_PERIOD = 42
 INTERIM_DAA_TARGET_TIMESPAN = (INTERIM_DAA_PERIOD - 1) * 30 * 60  # 73800 seconds
 
+# ASERT params mirror chainparams.cpp mainnet (`nPowTargetSpacing`,
+# `nASERTHalfLife`, `nBitsMin`, `nBitsMax`). The anchor is the last LOCKED_IN
+# block; ASERT is computed from the anchor's nBits and the time/height drift
+# since it (see src/pow.cpp::GetNextFACTORASERTWorkRequired).
+MAINNET_ASERT_ACTIVATION_HEIGHT = 176064  # first ASERT-computed block ("since")
+MAINNET_ASERT_ANCHOR_HEIGHT = MAINNET_ASERT_ACTIVATION_HEIGHT - 1  # 176063
+ASERT_TARGET_SPACING = 30 * 60          # seconds per block
+ASERT_HALF_LIFE = 2 * 24 * 60 * 60      # seconds
+ASERT_NBITS_MIN = 32
+ASERT_NBITS_MAX = 1022
+# Sentinel matching the C++ "clampedHigh" chain-halt: nBits=1024 is rejected
+# by every other code path (>1023 is outside the valid range).
+ASERT_CLAMPED_HIGH_SENTINEL = 1024
+
 
 def is_interim_daa_active(height: int) -> bool:
     return MAINNET_INTERIM_DAA_ACTIVATION_HEIGHT <= height < MAINNET_INTERIM_DAA_END_HEIGHT
+
+
+def is_asert_active(height: int) -> bool:
+    """Whether ASERT consensus rules apply at the given height.
+
+    Mainnet-only: real FACTOR testnet/signet/regtest enable ASERT from genesis
+    (ALWAYS_ACTIVE in chainparams.cpp), but this wallet only supports mainnet
+    ASERT, so testnet stays on the old DAA path."""
+    if constants.net.TESTNET:
+        return False
+    return height >= MAINNET_ASERT_ACTIVATION_HEIGHT
 
 
 def calculate_interim_daa_delta(nBits: int, proportion: float) -> int:
@@ -104,6 +142,69 @@ def calculate_interim_daa_delta(nBits: int, proportion: float) -> int:
         delta -= 2
 
     return delta
+
+
+def calculate_factor_asert(anchor_nbits: int, time_diff: int, height_diff: int) -> int:
+    """Pure-Python port of CalculateFACTORASERT (src/pow.cpp).
+
+    Returns the new nBits, or ASERT_CLAMPED_HIGH_SENTINEL (1024) when the
+    exponent pushes past nBitsMax — matching the C++ chain-halt behavior.
+    Mirrors the validated reference impl in
+    FACTOR/contrib/testgen/validate_nbits_aserti3_2d.py.
+    """
+    anchor_nbits &= ~1  # round down to even
+    if anchor_nbits < ASERT_NBITS_MIN:
+        anchor_nbits = ASERT_NBITS_MIN
+    elif anchor_nbits > ASERT_NBITS_MAX:
+        anchor_nbits = ASERT_NBITS_MAX
+
+    anchor_idx = anchor_nbits // 2 - 1
+    anchor_log2_compute = LOG2_COMPUTE_TABLE[anchor_idx]
+
+    expected_elapsed = height_diff * ASERT_TARGET_SPACING
+    time_error = expected_elapsed - time_diff
+
+    # C++ truncation-toward-zero, not Python's floor-toward-minus-infinity.
+    if time_error >= 0:
+        integer_part = time_error // ASERT_HALF_LIFE
+        remainder = time_error % ASERT_HALF_LIFE
+    else:
+        integer_part = -((-time_error) // ASERT_HALF_LIFE)
+        remainder = -((-time_error) % ASERT_HALF_LIFE)
+
+    frac_num = remainder << 32
+    if frac_num >= 0:
+        frac_part = frac_num // ASERT_HALF_LIFE
+    else:
+        frac_part = -((-frac_num) // ASERT_HALF_LIFE)
+
+    exponent_q32 = (integer_part << 32) + frac_part
+    target_log2_compute = anchor_log2_compute + exponent_q32
+
+    idx_min = ASERT_NBITS_MIN // 2 - 1
+    idx_max = ASERT_NBITS_MAX // 2 - 1
+
+    clamped_high = target_log2_compute > LOG2_COMPUTE_TABLE[idx_max]
+
+    if target_log2_compute <= LOG2_COMPUTE_TABLE[idx_min]:
+        result_idx = idx_min
+    elif target_log2_compute >= LOG2_COMPUTE_TABLE[idx_max]:
+        result_idx = idx_max
+    else:
+        lo, hi = idx_min, idx_max
+        while lo + 1 < hi:
+            mid = lo + (hi - lo) // 2
+            if LOG2_COMPUTE_TABLE[mid] <= target_log2_compute:
+                lo = mid
+            else:
+                hi = mid
+        dist_lo = target_log2_compute - LOG2_COMPUTE_TABLE[lo]
+        dist_hi = LOG2_COMPUTE_TABLE[hi] - target_log2_compute
+        result_idx = lo if dist_lo <= dist_hi else hi
+
+    if clamped_high:
+        return ASERT_CLAMPED_HIGH_SENTINEL
+    return (result_idx + 1) * 2
 
 
 class MissingHeader(Exception):
@@ -416,7 +517,17 @@ class Blockchain(Logger):
         num = len(data) // HEADER_SIZE
         start_height = index * constants.CHUNK_SIZE
         prev_hash = self.get_hash(start_height - 1)
-        target = self.get_target(index-1)
+        end_height = start_height + num - 1
+        asert_in_chunk = is_asert_active(end_height)
+        # legacy chunk target is still meaningful for any pre-ASERT block in this chunk
+        legacy_target = self.get_target(index - 1) if not is_asert_active(start_height) else None
+        # for ASERT, we need the timestamp of the block just before the first ASERT block in this chunk
+        prev_timestamp = None
+        if asert_in_chunk and is_asert_active(start_height):
+            prev_h = self.read_header(start_height - 1)
+            if not prev_h:
+                raise MissingHeader(start_height - 1)
+            prev_timestamp = prev_h['timestamp']
         for i in range(num):
             height = start_height + i
             try:
@@ -425,8 +536,13 @@ class Blockchain(Logger):
                 expected_header_hash = None
             raw_header = data[i*HEADER_SIZE : (i+1)*HEADER_SIZE]
             header = deserialize_header(raw_header, index * constants.CHUNK_SIZE + i)
+            if asert_in_chunk and is_asert_active(height):
+                target = self.get_asert_target(height, prev_timestamp)
+            else:
+                target = legacy_target
             self.verify_header(header, prev_hash, target, expected_header_hash)
             prev_hash = hash_header(header)
+            prev_timestamp = header['timestamp']
 
     @with_lock
     def path(self):
@@ -666,6 +782,18 @@ class Blockchain(Logger):
 
         return new_target
 
+    def get_asert_target(self, height: int, prev_timestamp: int) -> int:
+        """ASERT nBits for the block at `height`, given the timestamp of block (height-1).
+
+        Requires the anchor header (MAINNET_ASERT_ANCHOR_HEIGHT) to be on disk."""
+        anchor = self.read_header(MAINNET_ASERT_ANCHOR_HEIGHT)
+        if not anchor:
+            raise MissingHeader(MAINNET_ASERT_ANCHOR_HEIGHT)
+        anchor_nbits = int(anchor['bits'])
+        time_diff = prev_timestamp - anchor['timestamp']
+        height_diff = (height - 1) - MAINNET_ASERT_ANCHOR_HEIGHT
+        return calculate_factor_asert(anchor_nbits, time_diff, height_diff)
+
     def get_interim_daa_target(self, chunk_index: int) -> int:
         """Compute target for chunk chunk_index+1 using the 42-block interim DAA."""
         first_height = chunk_index * constants.CHUNK_SIZE
@@ -720,8 +848,14 @@ class Blockchain(Logger):
 
     def chainwork_of_header_at_height(self, height: int) -> int:
         """work done by single header at given height"""
-        chunk_idx = height // constants.CHUNK_SIZE - 1
-        target = self.get_target(chunk_idx)
+        if is_asert_active(height):
+            prev = self.read_header(height - 1)
+            if not prev:
+                raise MissingHeader(height - 1)
+            target = self.get_asert_target(height, prev['timestamp'])
+        else:
+            chunk_idx = height // constants.CHUNK_SIZE - 1
+            target = self.get_target(chunk_idx)
         work = ((2 ** 256 - target - 1) // (target + 1)) + 1
         return work
 
@@ -741,15 +875,33 @@ class Blockchain(Logger):
             cached_height -= constants.CHUNK_SIZE
         assert cached_height >= -1, cached_height
         running_total = _CHAINWORK_CACHE[self.get_hash(cached_height)]
+        # Under ASERT, every header in a chunk has its own nBits, so the
+        # per-block-work × CHUNK_SIZE shortcut no longer holds.
+        # Fragility: assumes ASERT activation falls on a chunk boundary (true
+        # for mainnet: 176064 = 262 × 672). A chunk straddling activation
+        # would take the legacy branch and incorrectly multiply the ASERT-
+        # derived work of end_h across the chunk's pre-ASERT prefix.
+        def work_in_chunk_ending_at(end_h: int) -> int:
+            first_h = end_h - constants.CHUNK_SIZE + 1
+            if is_asert_active(first_h):
+                return sum(self.chainwork_of_header_at_height(h)
+                           for h in range(first_h, end_h + 1))
+            return constants.CHUNK_SIZE * self.chainwork_of_header_at_height(end_h)
         while cached_height < last_retarget:
             cached_height += constants.CHUNK_SIZE
-            work_in_single_header = self.chainwork_of_header_at_height(cached_height)
-            work_in_chunk = constants.CHUNK_SIZE * work_in_single_header
-            running_total += work_in_chunk
+            running_total += work_in_chunk_ending_at(cached_height)
             _CHAINWORK_CACHE[self.get_hash(cached_height)] = running_total
+        # trailing partial chunk: sum per-block if any of its blocks are under ASERT
         cached_height += constants.CHUNK_SIZE
-        work_in_single_header = self.chainwork_of_header_at_height(cached_height)
-        work_in_last_partial_chunk = (height % constants.CHUNK_SIZE + 1) * work_in_single_header
+        partial_first = cached_height - constants.CHUNK_SIZE + 1
+        partial_last = partial_first + (height % constants.CHUNK_SIZE)
+        if is_asert_active(partial_last):
+            work_in_last_partial_chunk = sum(
+                self.chainwork_of_header_at_height(h)
+                for h in range(partial_first, partial_last + 1))
+        else:
+            work_in_single_header = self.chainwork_of_header_at_height(cached_height)
+            work_in_last_partial_chunk = (height % constants.CHUNK_SIZE + 1) * work_in_single_header
         return running_total + work_in_last_partial_chunk
 
     def can_connect(self, header: dict, check_height: bool=True) -> bool:
@@ -767,7 +919,13 @@ class Blockchain(Logger):
         if prev_hash != header.get('prev_block_hash'):
             return False
         try:
-            target = self.get_target(height // constants.CHUNK_SIZE - 1)
+            if is_asert_active(height):
+                prev_header = self.read_header(height - 1)
+                if not prev_header:
+                    return False
+                target = self.get_asert_target(height, prev_header['timestamp'])
+            else:
+                target = self.get_target(height // constants.CHUNK_SIZE - 1)
         except MissingHeader:
             return False
         try:
